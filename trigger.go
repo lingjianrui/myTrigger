@@ -1,10 +1,18 @@
 package sample
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"errors"
+	"io"
+	"net"
+	"strings"
+	"time"
+	"unicode/utf8"
 
-	"github.com/project-flogo/core/data/coerce"
 	"github.com/project-flogo/core/data/metadata"
+	"github.com/project-flogo/core/support/log"
 	"github.com/project-flogo/core/trigger"
 )
 
@@ -14,15 +22,16 @@ func init() {
 	_ = trigger.Register(&Trigger{}, &Factory{})
 }
 
-type Trigger struct {
-	settings *Settings
-	id       string
-	dEvents  []dummyOnEvent
-}
-
+// Factory is a kafka trigger factory
 type Factory struct {
 }
 
+// Metadata implements trigger.Factory.Metadata
+func (*Factory) Metadata() *trigger.Metadata {
+	return triggerMd
+}
+
+// New implements trigger.Factory.New
 func (*Factory) New(config *trigger.Config) (trigger.Trigger, error) {
 	s := &Settings{}
 	err := metadata.MapToStruct(config.Settings, s, true)
@@ -30,85 +39,170 @@ func (*Factory) New(config *trigger.Config) (trigger.Trigger, error) {
 		return nil, err
 	}
 
-	return &Trigger{id: config.Id, settings: s}, nil
+	return &Trigger{settings: s}, nil
 }
 
-func (f *Factory) Metadata() *trigger.Metadata {
-	return triggerMd
+// Trigger is a kafka trigger
+type Trigger struct {
+	settings    *Settings
+	handlers    []trigger.Handler
+	listener    net.Listener
+	logger      log.Logger
+	delimiter   byte
+	connections []net.Conn
 }
 
-// Metadata implements trigger.Trigger.Metadata
-func (t *Trigger) Metadata() *trigger.Metadata {
-	return triggerMd
-}
-
+// Initialize initializes the trigger
 func (t *Trigger) Initialize(ctx trigger.InitContext) error {
 
-	logger := ctx.Logger()
+	host := t.settings.Host
+	port := t.settings.Port
+	t.handlers = ctx.GetHandlers()
+	t.logger = ctx.Logger()
 
-	aSetting := t.settings.ASetting
-	logger.Debug("Setting 'aSetting' = %s", aSetting)
+	delimiter := t.settings.Delimiter
 
-	// Init handlers
-	for _, handler := range ctx.GetHandlers() {
-
-		s := &HandlerSettings{}
-		err := metadata.MapToStruct(handler.Settings(), s, true)
-		if err != nil {
-			return err
-		}
-
-		//init handler using setting
-		aSetting := s.ASetting
-		logger.Debug("Handler setting 'aSetting' = %s", aSetting)
-
-		t.dEvents = append(t.dEvents, registerDummyEventHandler(aSetting, newActionHandler(handler)))
+	if delimiter != "" {
+		r, _ := utf8.DecodeRuneInString(delimiter)
+		t.delimiter = byte(r)
 	}
 
-	return nil
+	if port == "" {
+		return errors.New("Valid port must be set")
+	}
+
+	listener, err := net.Listen(t.settings.Network, host+":"+port)
+	if err != nil {
+		return err
+	}
+
+	t.listener = listener
+
+	return err
 }
 
-// Start implements util.Managed.Start
+// Start starts the kafka trigger
 func (t *Trigger) Start() error {
-	//start servers/services if necessary
-	for _, val := range t.dEvents {
-		go val("data")
-	}
+
+	go t.waitForConnection()
+	t.logger.Infof("Started listener on Port - %s, Network - %s", t.settings.Port, t.settings.Network)
 	return nil
 }
 
-// Stop implements util.Managed.Stop
-func (t *Trigger) Stop() error {
-	//stop servers/services if necessary
-	return nil
-}
-
-// registerDummyEventHandler is used for dummy event handler registration, this should be replaced
-// with the appropriate event handling mechanism for the trigger.  Some form of a discriminator
-// should be used for dispatching to different handlers.  For example a REST based trigger might
-// dispatch based on the method and path.
-func registerDummyEventHandler(discriminator string, onEvent dummyOnEvent) dummyOnEvent {
-	//ignore
-	return onEvent
-}
-
-// dummyOnEvent is a dummy event handler for our dummy event source
-type dummyOnEvent func(interface{})
-
-func newActionHandler(handler trigger.Handler) dummyOnEvent {
-
-	return func(data interface{}) {
-
-		strData, _ := coerce.ToString(data)
-		output := &Output{AnOutput: strData}
-
-		results, err := handler.Handle(context.Background(), output.ToMap())
+func (t *Trigger) waitForConnection() {
+	for {
+		// Listen for an incoming connection.
+		conn, err := t.listener.Accept()
 		if err != nil {
-			//handle error
+			errString := err.Error()
+			if !strings.Contains(errString, "use of closed network connection") {
+				t.logger.Error("Error accepting connection: ", err.Error())
+			}
+			return
+		} else {
+			t.logger.Debugf("Handling new connection from client - %s", conn.RemoteAddr().String())
+			// Handle connections in a new goroutine.
+			go t.handleNewConnection(conn)
 		}
-		reply := &Reply{}
-		_ = reply.FromMap(results)
-
-		//do something with the reply
 	}
+}
+
+func (t *Trigger) handleNewConnection(conn net.Conn) {
+
+	//Gather connection list for later cleanup
+	t.connections = append(t.connections, conn)
+
+	for {
+
+		if t.settings.TimeOut > 0 {
+			t.logger.Info("Setting timeout: ", t.settings.TimeOut)
+			conn.SetDeadline(time.Now().Add(time.Duration(t.settings.TimeOut) * time.Millisecond))
+		}
+
+		output := &Output{}
+
+		if t.delimiter != 0 {
+			data, err := bufio.NewReader(conn).ReadBytes(t.delimiter)
+			if err != nil {
+				errString := err.Error()
+				if !strings.Contains(errString, "use of closed network connection") {
+					t.logger.Error("Error reading data from connection: ", err.Error())
+				} else {
+					t.logger.Info("Connection is closed.")
+				}
+				if nerr, ok := err.(net.Error); !ok || !nerr.Timeout() {
+					// Return if not timeout error
+					return
+				}
+
+			} else {
+				output.Data = string(data[:len(data)-1])
+			}
+		} else {
+			var buf bytes.Buffer
+			_, err := io.Copy(&buf, conn)
+			if err != nil {
+				errString := err.Error()
+				if !strings.Contains(errString, "use of closed network connection") {
+					t.logger.Error("Error reading data from connection: ", err.Error())
+				} else {
+					t.logger.Info("Connection is closed.")
+				}
+				if nerr, ok := err.(net.Error); !ok || !nerr.Timeout() {
+					// Return if not timeout error
+					return
+				}
+			} else {
+				output.Data = string(buf.Bytes())
+			}
+		}
+
+		if output.Data != "" {
+			var replyData []string
+			for i := 0; i < len(t.handlers); i++ {
+				results, err := t.handlers[i].Handle(context.Background(), output)
+				if err != nil {
+					t.logger.Error("Error invoking action : ", err.Error())
+					continue
+				}
+
+				reply := &Reply{}
+				err = reply.FromMap(results)
+				if err != nil {
+					t.logger.Error("Failed to convert flow output : ", err.Error())
+					continue
+				}
+				if reply.Reply != "" {
+					replyData = append(replyData, reply.Reply)
+				}
+			}
+
+			if len(replyData) > 0 {
+				replyToSend := strings.Join(replyData, string(t.delimiter))
+				// Send a response back to client contacting us.
+				_, err := conn.Write([]byte(replyToSend + "\n"))
+				if err != nil {
+					t.logger.Error("Failed to write to connection : ", err.Error())
+				}
+			}
+		}
+	}
+}
+
+// Stop implements ext.Trigger.Stop
+func (t *Trigger) Stop() error {
+
+	for i := 0; i < len(t.connections); i++ {
+		t.connections[i].Close()
+	}
+
+	t.connections = nil
+
+	if t.listener != nil {
+		t.listener.Close()
+	}
+
+	t.logger.Info("Stopped listener")
+
+	return nil
 }

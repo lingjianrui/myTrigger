@@ -5,21 +5,34 @@ import (
 )
 
 type Settings struct {
-	ASetting int `md:"aSetting,required"`
+	Network   string `md:"network"`       // The network type
+	Host      string `md:"host"`          // The host name or IP for TCP server.
+	Port      string `md:"port,required"` // The port to listen on
+	Delimiter string `md:"delimiter"`     // Data delimiter for read and write
+	TimeOut   int    `md:"timeout"`
 }
 
 type HandlerSettings struct {
-	ASetting string `md:"aSetting,required"`
 }
 
 type Output struct {
-	AnOutput string `md:"anOutput"`
+	Data string `md:"data"` // The data received from the connection
+}
+
+type Reply struct {
+	Reply string `md:"reply"` // The reply to be sent back
+}
+
+func (o *Output) ToMap() map[string]interface{} {
+	return map[string]interface{}{
+		"data": o.Data,
+	}
 }
 
 func (o *Output) FromMap(values map[string]interface{}) error {
 
 	var err error
-	o.AnOutput, err = coerce.ToString(values["anOutput"])
+	o.Data, err = coerce.ToString(values["data"])
 	if err != nil {
 		return err
 	}
@@ -27,23 +40,19 @@ func (o *Output) FromMap(values map[string]interface{}) error {
 	return nil
 }
 
-func (o *Output) ToMap() map[string]interface{} {
+func (r *Reply) ToMap() map[string]interface{} {
 	return map[string]interface{}{
-		"anOutput": o.AnOutput,
+		"reply": r.Reply,
 	}
-}
-
-type Reply struct {
-	AReply interface{} `md:"aReply"`
 }
 
 func (r *Reply) FromMap(values map[string]interface{}) error {
-	r.AReply = values["aReply"]
-	return nil
-}
 
-func (r *Reply) ToMap() map[string]interface{} {
-	return map[string]interface{}{
-		"aReply": r.AReply,
+	var err error
+	r.Reply, err = coerce.ToString(values["reply"])
+	if err != nil {
+		return err
 	}
+
+	return nil
 }
